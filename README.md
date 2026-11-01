@@ -1,1 +1,9 @@
-index.html is just a page that already works without any problem, and main.go is local server which can slightly make it faster.
+##Вавилонская галерея##
+Вся галерея — один статический файл index.html. Сервер не нужен: рендер, поиск, фильмы
+и конвертация видео работают в браузере.
+
+Go-часть (необязательно)
+go run main.go — локальный сервер с тем же index.html (он встроен в бинарник через go:embed).
+go run main.go -o out.png -seed 42 — картинка в файл.
+go run main.go -video clip.mp4 -w 96 -every 5 -o clip.txt — быстрая конвертация больших видео через ffmpeg
+(формат txt тот же, что делает веб-версия).
