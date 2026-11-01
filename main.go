@@ -17,6 +17,7 @@
 // Видео → txt с ID кадров (нужен ffmpeg; берём каждый N-й кадр, пиксели усредняются):
 //
 //	go run main.go -video clip.mp4 -w 96 -every 5 -bpp 8 -o clip.txt
+//	go run main.go -video clip.mp4 -w 96 -every 5 -bpp 8 -o clip.png   (PNG-лист кадров: меньше и открывается в галерее)
 //	(-h не указан → высота считается по пропорциям видео; -ss 10 -t 30 — взять отрезок)
 //
 // Полученный txt вставляется в веб-интерфейс («Найти экспонат» → вставить текст или
@@ -225,7 +226,7 @@ func main() {
 	scale := flag.Int("scale", 0, "размер клетки в пикселях (0 = авто, ~1024 px)")
 	out := flag.String("o", "", "куда сохранить PNG (включает режим CLI)")
 	printID := flag.Bool("printid", false, "напечатать полный ID")
-	video := flag.String("video", "", "видеофайл → txt с ID кадров (нужен ffmpeg); -o = куда писать txt")
+	video := flag.String("video", "", "видеофайл → txt с ID кадров или PNG-лист, если -o *.png (нужен ffmpeg)")
 	every := flag.Int("every", 5, "видео: брать каждый N-й кадр")
 	ss := flag.String("ss", "", "видео: начать с этого момента (сек или чч:мм:сс)")
 	dur := flag.String("t", "", "видео: длительность (сек или чч:мм:сс)")
@@ -488,7 +489,7 @@ func passthroughFlags() []string {
 // обрабатываются вообще), scale=area усредняет пиксели, rawvideo идёт по пайпу; здесь
 // кадр квантуется и пишется одной строкой base64url.
 func convertVideo(ctx context.Context, path string, s spec, every int, ss, dur string,
-	info videoInfo, out io.Writer, progress func(n int)) (int, error) {
+	info videoInfo, out io.Writer, progress func(n int), collect *[][]byte) (int, error) {
 	if every < 1 {
 		every = 1
 	}
@@ -517,7 +518,9 @@ func convertVideo(ctx context.Context, path string, s spec, every int, ss, dur s
 	}
 	rd := bufio.NewReaderSize(stdout, 1<<20)
 	bw := bufio.NewWriterSize(out, 1<<20)
-	fmt.Fprintf(bw, "#babel1 w=%d h=%d b=%d fps=%.3f every=%d\n", s.w, s.h, s.bpp, info.fps/float64(every), every)
+	if collect == nil {
+		fmt.Fprintf(bw, "#babel1 w=%d h=%d b=%d fps=%.3f every=%d\n", s.w, s.h, s.bpp, info.fps/float64(every), every)
+	}
 
 	frame := make([]byte, s.w*s.h*3)
 	packed := make([]byte, s.nbytes())
@@ -529,12 +532,16 @@ func convertVideo(ctx context.Context, path string, s spec, every int, ss, dur s
 		}
 		packFrame(frame, s, packed)
 		s.maskPad(packed)
-		base64.RawURLEncoding.Encode(line, packed)
-		line[len(line)-1] = '\n'
-		if _, err := bw.Write(line); err != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return n, err
+		if collect != nil {
+			*collect = append(*collect, append([]byte(nil), packed...))
+		} else {
+			base64.RawURLEncoding.Encode(line, packed)
+			line[len(line)-1] = '\n'
+			if _, err := bw.Write(line); err != nil {
+				cmd.Process.Kill()
+				cmd.Wait()
+				return n, err
+			}
 		}
 		n++
 		if progress != nil && n%25 == 0 {
@@ -558,6 +565,81 @@ func convertVideo(ctx context.Context, path string, s spec, every int, ss, dur s
 	return n, nil
 }
 
+// ---- PNG-лист кадров (формат читается веб-интерфейсом: «Найти экспонат» → выбрать картинку) ----
+// Первая строка пикселей — заголовок (18 байт по 3 на пиксель):
+// 'BBL1', w[2], h[2], bpp, fps*1000[3], число кадров[3], колонок[2], 0.
+// Ниже кадры подряд сеткой, каждый кадр в цветах палитры (1 клетка = 1 пиксель).
+
+func sheetLayout(s spec, n int) (cols, rows int) {
+	cols = int(math.Round(math.Sqrt(float64(n) * float64(s.h) / float64(s.w))))
+	if cols < 1 {
+		cols = 1
+	}
+	if cols > n {
+		cols = n
+	}
+	if cols*s.w < 6 {
+		cols = (6 + s.w - 1) / s.w
+	}
+	return cols, (n + cols - 1) / cols
+}
+
+func buildSheet(s spec, frames [][]byte, fps float64) (*image.RGBA, error) {
+	n := len(frames)
+	cols, rows := sheetLayout(s, n)
+	W, H := cols*s.w, 1+rows*s.h
+	if W > 16384 || H > 16384 {
+		return nil, errors.New("слишком много кадров для одной картинки: уменьшите -w или увеличьте -every")
+	}
+	img := image.NewRGBA(image.Rect(0, 0, W, H))
+	for i := 0; i < W*H; i++ {
+		img.Pix[i*4+3] = 255
+	}
+	f := int(math.Round(fps * 1000))
+	hb := []byte{'B', 'B', 'L', '1', byte(s.w >> 8), byte(s.w), byte(s.h >> 8), byte(s.h), byte(s.bpp),
+		byte(f >> 16), byte(f >> 8), byte(f), byte(n >> 16), byte(n >> 8), byte(n), byte(cols >> 8), byte(cols), 0}
+	for i := 0; i < 6; i++ {
+		copy(img.Pix[i*4:], hb[i*3:i*3+3])
+	}
+	for k, b := range frames {
+		fr := renderImage(s, b, 1)
+		x0, y0 := (k%cols)*s.w, 1+(k/cols)*s.h
+		for y := 0; y < s.h; y++ {
+			copy(img.Pix[(y0+y)*img.Stride+x0*4:], fr.Pix[y*fr.Stride:y*fr.Stride+s.w*4])
+		}
+	}
+	return img, nil
+}
+
+func runVideoPNG(path string, s spec, every int, ss, dur, outPath string, info videoInfo) error {
+	start := time.Now()
+	var frames [][]byte
+	n, err := convertVideo(context.Background(), path, s, every, ss, dur, info, nil,
+		func(n int) { fmt.Fprintf(os.Stderr, "\rкадров: %d", n) }, &frames)
+	fmt.Fprint(os.Stderr, "\r")
+	if err != nil {
+		return err
+	}
+	img, err := buildSheet(s, frames, info.fps/float64(every))
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := (&png.Encoder{CompressionLevel: png.BestCompression}).Encode(f, img); err != nil {
+		return err
+	}
+	st, _ := f.Stat()
+	fmt.Printf("готово: %s (%dx%d px)\n", outPath, img.Bounds().Dx(), img.Bounds().Dy())
+	fmt.Printf("кадров: %d (каждый %d-й из ~%.1f к/с), сетка %dx%d, %d бит/клетка, воспроизведение %.2f к/с\n",
+		n, every, info.fps, s.w, s.h, s.bpp, info.fps/float64(every))
+	fmt.Printf("размер: %.1f МБ, время: %.1f с\n", float64(st.Size())/1e6, time.Since(start).Seconds())
+	return nil
+}
+
 func runVideoCLI(path string, s spec, autoH bool, every int, ss, dur, outPath string) error {
 	info, err := probeVideo(path)
 	if err != nil {
@@ -572,6 +654,9 @@ func runVideoCLI(path string, s spec, autoH bool, every int, ss, dur, outPath st
 	if every < 1 {
 		return errors.New("-every должен быть >= 1")
 	}
+	if strings.EqualFold(filepath.Ext(outPath), ".png") {
+		return runVideoPNG(path, s, every, ss, dur, outPath, info)
+	}
 	f, err := os.Create(outPath)
 	if err != nil {
 		return err
@@ -579,7 +664,7 @@ func runVideoCLI(path string, s spec, autoH bool, every int, ss, dur, outPath st
 	defer f.Close()
 	start := time.Now()
 	n, err := convertVideo(context.Background(), path, s, every, ss, dur, info, f,
-		func(n int) { fmt.Fprintf(os.Stderr, "\rкадров: %d", n) })
+		func(n int) { fmt.Fprintf(os.Stderr, "\rкадров: %d", n) }, nil)
 	fmt.Fprint(os.Stderr, "\r")
 	if err != nil {
 		return err
@@ -749,7 +834,7 @@ func handleVideo(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.Remove(outF.Name())
 	defer outF.Close()
-	if _, err := convertVideo(r.Context(), tmp.Name(), s, every, ss, dur, info, outF, nil); err != nil {
+	if _, err := convertVideo(r.Context(), tmp.Name(), s, every, ss, dur, info, outF, nil, nil); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
