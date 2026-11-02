@@ -81,11 +81,11 @@
   <div class="frame"><div class="mat"><div class="inner" id="inner"><canvas id="cv"></canvas></div></div></div>
 
   <div class="nav">
-    <button id="bPrev" title="Предыдущий (←)"><svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg></button>
-    <button id="bBack" title="Назад по истории"><svg viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>
+    <button id="bPrev" title="Предыдущий экспонат (←; Shift — только последняя клетка)"><svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg></button>
+    <button id="bBack" title="Повернуть на 90° против часовой (Shift+R)"><svg viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>
     <button class="big" id="bPlay" title="Автопоказ (пробел)"><svg id="icPlay" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3" fill="currentColor"/></svg></button>
-    <button id="bFwd" title="Вперёд по истории"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
-    <button id="bNext" title="Следующий (→)"><svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></button>
+    <button id="bFwd" title="Повернуть на 90° по часовой (R)"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+    <button id="bNext" title="Следующий экспонат (→; Shift — только последняя клетка)"><svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></button>
   </div>
 
   <div class="nav2">
@@ -330,7 +330,7 @@ function scheduleHash() {
 // ---- история ----
 var back = [], fwd = [];
 function snap() { return { w: S.w, h: S.h, bpp: S.bpp, b: bytes.slice() }; }
-function navState() { $('bBack').disabled = !back.length; $('bFwd').disabled = !fwd.length; }
+function navState() {}   // история теперь на Ctrl+Z / Ctrl+Shift+Z
 function push() {
   if (!bytes) return;
   back.push(snap());
@@ -364,8 +364,99 @@ function applySettings() {
   $('presets').appendChild(bt);
 });
 
+// ---- шаг по галерее: как в оригинале ----
+// Из 8 подряд идущих экспонатов 7 выглядят как шум, а каждый 8-й — это снова исходная картинка,
+// но с небольшим изменением, которое начинается с правого нижнего угла (там «счётчик»).
+// Устройство шага T («→»; «←» — точно обратный):
+//  • последние Q клеток (правый нижний угол) — счётчик: каждый шаг прибавляет к нему число E (с переносом
+//    между клетками), поэтому за 8 шагов он сдвигается на 8·E — меняется правый нижний угол, а при переносе и соседи;
+//  • остальные клетки разбиты на циклы по 8 случайных клеток; за шаг каждая клетка берёт значение
+//    соседа по циклу и прибавляет свою случайную добавку (по модулю числа цветов). Сумма добавок
+//    по каждому циклу = 0, значит ровно за 8 шагов всё возвращается как было.
+var walkCache = null;
+function rng32(seed) {                                 // mulberry32
+  var a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    var z = Math.imul(a ^ (a >>> 15), 1 | a);
+    z = (z + Math.imul(z ^ (z >>> 7), 61 | z)) ^ z;
+    return (z ^ (z >>> 14)) >>> 0;
+  };
+}
+function walkFor(s) {
+  var key = s.w + 'x' + s.h + 'x' + s.bpp;
+  if (walkCache && walkCache.key === key) return walkCache;
+  var n = s.w * s.h, B = s.bpp === 24 ? 16777216 : (1 << s.bpp);
+  var Q = Math.min(n, 8 + (n % 8)), nn = n - Q;        // nn кратно 8
+  var rnd = rng32(0x85EBCA6B ^ (n * 31 + s.bpp)), i, j, t, g;
+  var arr = new Uint32Array(nn);
+  for (i = 0; i < nn; i++) arr[i] = i;
+  for (i = nn - 1; i > 0; i--) { j = rnd() % (i + 1); t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
+  var pi = new Uint32Array(nn), e = new Uint32Array(nn);
+  for (g = 0; g < nn; g += 8) {
+    var sum = 0;
+    for (i = 0; i < 8; i++) {
+      pi[arr[g + i]] = arr[g + (i + 1) % 8];
+      if (i < 7) { e[arr[g + i]] = rnd() % B; sum = (sum + e[arr[g + i]]) % B; }
+    }
+    e[arr[g + 7]] = (B - sum) % B;                     // сумма добавок цикла ≡ 0
+  }
+  var bB = BigInt(B), mod = BigInt(1), E = BigInt(0);
+  for (i = 0; i < Q; i++) mod *= bB;
+  E = BigInt((rnd() % B) | 1);                         // добавка только в самую младшую клетку (правый нижний угол), нечётная: за 8 шагов она точно меняется
+  return (walkCache = { key: key, n: n, B: B, Q: Q, nn: nn, pi: pi, e: e, bB: bB, mod: mod, E: E });
+}
+function stepWalk(b, m) {                              // m шагов (m — целое со знаком)
+  var wk = walkFor(S), B = wk.B, Q = wk.Q, nn = wk.nn, bpp = S.bpp, i, s;
+  var r = ((m % 8) + 8) % 8;                           // T^8 на «шумовой» части = тождество
+  if (r && nn > 0) {
+    var cur = new Uint32Array(nn), nxt = new Uint32Array(nn), pi = wk.pi, e = wk.e, v;
+    for (i = 0; i < nn; i++) cur[i] = getPix(b, i, bpp);
+    for (s = 0; s < r; s++) {
+      for (i = 0; i < nn; i++) { v = cur[pi[i]] + e[i]; if (v >= B) v -= B; nxt[i] = v; }
+      var tmp = cur; cur = nxt; nxt = tmp;
+    }
+    for (i = 0; i < nn; i++) setPix(b, i, bpp, cur[i]);
+  }
+  var V = BigInt(0), bB = wk.bB;                       // счётчик в правом нижнем углу
+  for (i = 0; i < Q; i++) V = V * bB + BigInt(getPix(b, nn + i, bpp));
+  V = (V + BigInt(m) * wk.E) % wk.mod; if (V < BigInt(0)) V += wk.mod;
+  for (i = Q - 1; i >= 0; i--) { setPix(b, nn + i, bpp, Number(V % bB)); V = V / bB; }
+}
+
+// ---- поворот экспоната на 90° ----
+function getPix(b, p, bpp) {
+  if (bpp === 8) return b[p];
+  if (bpp === 24) { var o = p * 3; return (b[o] << 16) | (b[o + 1] << 8) | b[o + 2]; }
+  var v = 0, pos = p * bpp;
+  for (var i = 0; i < bpp; i++) v = (v << 1) | ((b[(pos + i) >> 3] >> (7 - ((pos + i) & 7))) & 1);
+  return v;
+}
+function rotateBytes(b, s, cw) {                       // возвращает байты экспоната размера h×w
+  var w = s.w, h = s.h, bpp = s.bpp, out = new Uint8Array(b.length);
+  for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+    var q = cw ? x * h + (h - 1 - y) : (w - 1 - x) * h + y, v = getPix(b, y * w + x, bpp);
+    if (bpp === 8) out[q] = v;
+    else if (bpp === 24) { out[q * 3] = v >> 16; out[q * 3 + 1] = (v >> 8) & 255; out[q * 3 + 2] = v & 255; }
+    else setPix(out, q, bpp, v);
+  }
+  return out;
+}
+function rotate(cw) {
+  var ns = { w: S.h, h: S.w, bpp: S.bpp };
+  if (film) {
+    var m = parseFilm(filmText).meta, ids = film.ids, i, b;
+    for (i = 0; i < ids.length; i++) { b = dec(ids[i]); ids[i] = enc(rotateBytes(b, S, cw)); }
+    S = ns;
+    filmText = '#babel1 w=' + S.w + ' h=' + S.h + ' b=' + S.bpp + ' fps=' + (m.fps || '8') + ' every=1\n' + ids.join('\n') + '\n';
+    syncInputs(); showFrame(film.idx);
+    return;
+  }
+  bytes = rotateBytes(bytes, S, cw); S = ns; syncInputs(); render();
+}
+
 // ---- навигация ----
-function step(d, k) {
+function step(d, k, fine) {
   k = k || 1;
   if (film) {
     var n = film.ids.length, i = film.idx + d * k;
@@ -373,7 +464,8 @@ function step(d, k) {
     else i = Math.max(0, Math.min(n - 1, i));
     filmStop(); showFrame(i); return;
   }
-  for (var j = 0; j < k; j++) addOne(bytes, d);
+  if (fine) { for (var j = 0; j < k; j++) addOne(bytes, d); }   // Shift: старый шаг +1/−1
+  else stepWalk(bytes, d * k);
   render();
 }
 function lucky() { closeFilm(); push(); newRandom(); render(); }
@@ -392,29 +484,29 @@ function holdTick(t) {
   var dt = Math.min(t - hs.last, 100); hs.last = t;
   hs.acc += holdRate(t - hs.t0) * dt / 1000;
   var k = Math.floor(hs.acc);
-  if (k >= 1) { hs.acc -= k; step(hs.d, k); }   // на быстрой скорости за кадр экрана пропускаем k экспонатов
+  if (k >= 1) { hs.acc -= k; step(hs.d, k, hs.fine); }   // на быстрой скорости за кадр экрана пропускаем k экспонатов
   hs.raf = requestAnimationFrame(holdTick);
 }
 function holdStop() {
   if (hs.raf) cancelAnimationFrame(hs.raf);
   hs.raf = 0; hs.d = 0; hs.key = null;
 }
-function holdStart(d, key) {
+function holdStart(d, key, fine) {
   holdStop();
-  step(d);
-  hs.d = d; hs.key = key; hs.t0 = 0; hs.acc = 0;
+  step(d, 1, fine);
+  hs.fine = !!fine; hs.d = d; hs.key = key; hs.t0 = 0; hs.acc = 0;
   hs.raf = requestAnimationFrame(holdTick);
 }
 function hold(btn, d) {
-  btn.addEventListener('pointerdown', function (e) { e.preventDefault(); holdStart(d, 'ptr'); });
+  btn.addEventListener('pointerdown', function (e) { e.preventDefault(); holdStart(d, 'ptr', e.shiftKey); });
   ['pointerup', 'pointerleave', 'pointercancel'].forEach(function (ev) {
     btn.addEventListener(ev, function () { if (hs.key === 'ptr') holdStop(); });
   });
   btn.addEventListener('click', function (e) { if (e.detail === 0) step(d); });
 }
 hold($('bPrev'), -1); hold($('bNext'), 1);
-$('bBack').addEventListener('click', goBack);
-$('bFwd').addEventListener('click', goFwd);
+$('bBack').addEventListener('click', function () { rotate(false); });
+$('bFwd').addEventListener('click', function () { rotate(true); });
 $('bLucky').addEventListener('click', lucky);
 
 // ---- автопоказ ----
@@ -893,8 +985,11 @@ document.addEventListener('keydown', function (e) {
   if (dlg.open || t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
     e.preventDefault();
-    if (!e.repeat) holdStart(e.key === 'ArrowLeft' ? -1 : 1, e.key);   // автоповтор браузера игнорируем — крутим свой цикл
+    if (!e.repeat) holdStart(e.key === 'ArrowLeft' ? -1 : 1, e.key, e.shiftKey);   // автоповтор браузера игнорируем — крутим свой цикл
   }
+  else if ((e.key === 'r' || e.key === 'R' || e.key === 'к' || e.key === 'К') && !e.ctrlKey && !e.metaKey && !e.altKey) { rotate(!e.shiftKey); e.preventDefault(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z' || e.key === 'я' || e.key === 'Я')) { (e.shiftKey ? goFwd : goBack)(); e.preventDefault(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) { goFwd(); e.preventDefault(); }
   else if (e.key === ' ' && t !== 'BUTTON') { togglePlay(); e.preventDefault(); }
 });
 
@@ -919,3 +1014,5 @@ window.addEventListener('blur', holdStop);
 </script>
 </body>
 </html>
+
+
