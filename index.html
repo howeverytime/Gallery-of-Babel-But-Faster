@@ -125,6 +125,14 @@
           <option value="walk">плавное «блуждание»</option>
         </select>
       </label>
+      <label class="wide chk"><input type="checkbox" id="iauto" checked> при загрузке картинки подгонять высоту под её пропорции</label>
+      <label class="wide">Продвинутое: картинки не из галереи
+        <select id="imode">
+          <option value="nearest" selected>искать ближайший экспонат</option>
+          <option value="tiles">открывать как фильм из плиток (кадр = кусок картинки)</option>
+          <option value="bytes">открывать как фильм из байтов (каша)</option>
+        </select>
+      </label>
       <label>Скорость: <span id="spv">8</span>/с
         <input type="range" id="sp" min="1" max="60" value="8">
       </label>
@@ -151,10 +159,11 @@
       <div class="wide row" style="margin-top:0">
         <button id="vGo">Конвертировать и проиграть</button>
         <button id="vPng" disabled>Скачать PNG</button>
+        <button id="vRaw" disabled title="Байты кадров как есть, по 3 на пиксель: выглядит как шум">PNG-каша</button>
         <button id="vDl" disabled>.txt</button>
       </div>
     </div>
-    <div class="info" id="vinfo">Всё считается прямо в вашем браузере, видео никуда не загружается. Ширина, число цветов (и высота, если галочка снята) берутся из «Настроек». Работают форматы, которые умеет открывать сам браузер (mp4, webm, mov). Результат можно скачать картинкой-листом кадров (PNG, без потерь: отправляйте её файлом, не «фото») или текстом. И то и другое загружается через «Найти экспонат».</div>
+    <div class="info" id="vinfo">Всё считается прямо в вашем браузере, видео никуда не загружается. Ширина, число цветов (и высота, если галочка снята) берутся из «Настроек». Работают форматы, которые умеет открывать сам браузер (mp4, webm, mov). Результат можно скачать картинкой-листом кадров (PNG, без потерь: отправляйте её файлом, не «фото»), «кашей» (те же байты, записанные прямо в пиксели: выглядит как шум) или текстом. И то и другое загружается через «Найти экспонат».</div>
   </details>
 </div>
 
@@ -164,7 +173,7 @@
     <textarea id="fid" spellcheck="false" placeholder="вставьте ID или ссылку на экспонат"></textarea>
   </label>
   <div class="row"><button id="fGo">Найти по ID</button></div>
-  <p style="margin:16px 0 6px">…или загрузите картинку: найдём ближайший экспонат для текущих настроек (скачанная из галереи находится точно). PNG-лист кадров, скачанный отсюда, откроется как фильм.</p>
+  <p style="margin:16px 0 6px">…или загрузите картинку: найдём ближайший экспонат для текущих настроек (скачанная из галереи находится точно). PNG-лист или «каша», скачанные отсюда, откроются как фильм. В «Настройках → Продвинутое» можно заставить галерею открывать как фильм вообще любую картинку.</p>
   <input type="file" id="ff" accept="image/*">
   <p style="margin:16px 0 6px">…или файл с кадрами (.txt), либо вставьте весь текст кадров в поле выше:</p>
   <input type="file" id="ft" accept=".txt,text/plain">
@@ -521,9 +530,18 @@ $('ff').addEventListener('change', function () {
   im.onload = function () {
     URL.revokeObjectURL(url);
     try {
-      var ft = pngToFilmText(im);
+      var ft = null, mode = $('imode').value;
+      try { ft = pngToFilmText(im); } catch (e) { if (mode === 'nearest') throw e; }   // заголовок повреждён — читаем принудительно
+      if (!ft && mode !== 'nearest') ft = imageToFilmText(im, mode);
       if (ft) { loadFilm(ft); dlg.close(); toast('Фильм загружен'); }
-      else { closeFilm(); push(); bytes = imageToBytes(im); render(); dlg.close(); toast('Ближайший экспонат найден'); }
+      else {
+        closeFilm(); push();
+        if ($('iauto').checked) {
+          var nh = Math.max(1, Math.min(512, Math.round(S.w * im.naturalHeight / im.naturalWidth)));
+          if (nh !== S.h) { S = { w: S.w, h: nh, bpp: S.bpp }; syncInputs(); }
+        }
+        bytes = imageToBytes(im); render(); dlg.close(); toast('Ближайший экспонат найден');
+      }
     }
     catch (e) { $('msg').textContent = e.message; }
     $('ff').value = '';
@@ -579,7 +597,7 @@ function loadFilm(text) {
   $('ffps').value = Math.max(0.5, Math.min(60, Math.round(fps * 2) / 2));
   $('ffv').textContent = $('ffps').value;
   $('filmbar').hidden = false;
-  $('vDl').disabled = false; $('vPng').disabled = false;
+  $('vDl').disabled = false; $('vPng').disabled = false; $('vRaw').disabled = false;
   showFrame(0);
   filmStart();
 }
@@ -759,6 +777,7 @@ function pngToFilmText(im) {
   var x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(im, 0, 0);
   var d = x.getImageData(0, 0, iw, ih).data, hb = [], i;
   for (i = 0; i < 6; i++) hb.push(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]);
+  if (hb[0] === 66 && hb[1] === 66 && hb[2] === 76 && hb[3] === 50) return rawToFilmText(d, iw, ih);
   if (hb[0] !== 66 || hb[1] !== 66 || hb[2] !== 76 || hb[3] !== 49) return null;
   var w = (hb[4] << 8) | hb[5], h = (hb[6] << 8) | hb[7], bpp = hb[8];
   var f = (hb[9] << 16) | (hb[10] << 8) | hb[11], n = (hb[12] << 16) | (hb[13] << 8) | hb[14], cols = (hb[15] << 8) | hb[16];
@@ -776,6 +795,65 @@ function pngToFilmText(im) {
   }
   return lines.join('\n') + '\n';
 }
+// ---- «каша»: байты кадров подряд, по 3 байта на пиксель (R,G,B) ----
+// Поток: 'BBL2', w[2], h[2], bpp, fps*1000[3], число кадров[3], 0,0,0 (18 байт), затем кадры подряд
+// (каждый nbytes байт, как в ID). Дальше нули до конца последнего пикселя.
+function filmToRaw(text, cb) {
+  var p = parseFilm(text), m = p.meta, ids = p.ids, n = ids.length;
+  var ns = { w: +m.w || S.w, h: +m.h || S.h, bpp: +m.b || S.bpp }, nb = nbytes(ns), total = 18 + n * nb;
+  var px = Math.ceil(total / 3), W = Math.max(6, Math.ceil(Math.sqrt(px))), H = Math.ceil(px / W);
+  if (W > 16384 || H > 16384) throw new Error('слишком много кадров для одной картинки');
+  var st = new Uint8Array(W * H * 3), f = Math.round((parseFloat(m.fps) || 8) * 1000);
+  st.set([66, 66, 76, 50, ns.w >> 8, ns.w & 255, ns.h >> 8, ns.h & 255, ns.bpp, f >> 16, (f >> 8) & 255, f & 255, n >> 16, (n >> 8) & 255, n & 255, 0, 0, 0]);
+  for (var k = 0; k < n; k++) { var b = dec(ids[k]); maskPad(b, ns); st.set(b, 18 + k * nb); }
+  var c = document.createElement('canvas'); c.width = W; c.height = H;
+  var x = c.getContext('2d'), img = x.createImageData(W, H), u = new Uint32Array(img.data.buffer);
+  for (var i = 0, o = 0; i < W * H; i++, o += 3) u[i] = pack(st[o], st[o + 1], st[o + 2]);
+  x.putImageData(img, 0, 0);
+  c.toBlob(cb, 'image/png');
+}
+function rawToFilmText(d, iw, ih) {
+  var cnt = iw * ih, st = new Uint8Array(cnt * 3);
+  for (var i = 0, o = 0; i < cnt; i++, o += 3) { st[o] = d[i * 4]; st[o + 1] = d[i * 4 + 1]; st[o + 2] = d[i * 4 + 2]; }
+  var w = (st[4] << 8) | st[5], h = (st[6] << 8) | st[7], bpp = st[8];
+  var f = (st[9] << 16) | (st[10] << 8) | st[11], n = (st[12] << 16) | (st[13] << 8) | st[14];
+  var ns = { w: w, h: h, bpp: bpp };
+  if (w < 1 || h < 1 || w > 512 || h > 512 || [1, 2, 4, 8, 12, 24].indexOf(bpp) < 0 || !n || 18 + n * nbytes(ns) > st.length)
+    throw new Error('похоже на «кашу» из галереи, но она повреждена (возможно, картинку пережали: пересылайте как файл, а не как фото)');
+  var nb = nbytes(ns), lines = ['#babel1 w=' + w + ' h=' + h + ' b=' + bpp + ' fps=' + (f / 1000).toFixed(3) + ' every=1'];
+  for (var k = 0; k < n; k++) { var b = st.slice(18 + k * nb, 18 + (k + 1) * nb); maskPad(b, ns); lines.push(enc(b)); }
+  return lines.join('\n') + '\n';
+}
+// ---- «любая картинка — это фильм»: размеры кадра берём из настроек, заголовок не нужен ----
+var FORCE_MAX_FRAMES = 20000, FORCE_MAX_CHARS = 150e6;
+function imageToFilmText(im, mode) {
+  var iw = im.naturalWidth, ih = im.naturalHeight, ns = { w: S.w, h: S.h, bpp: S.bpp }, w = ns.w, h = ns.h;
+  var c = document.createElement('canvas'); c.width = iw; c.height = ih;
+  var x = c.getContext('2d', { willReadFrequently: true });
+  x.fillStyle = '#fff'; x.fillRect(0, 0, iw, ih); x.drawImage(im, 0, 0);
+  var d = x.getImageData(0, 0, iw, ih).data, nb = nbytes(ns), idLen = Math.ceil(nb * 4 / 3), lines = [], k, y;
+  var cap = Math.min(FORCE_MAX_FRAMES, Math.floor(FORCE_MAX_CHARS / idLen)), n;
+  if (mode === 'tiles') {
+    var cols = Math.floor(iw / w), rows = Math.floor(ih / h);
+    if (!cols || !rows) throw new Error('картинка (' + iw + '×' + ih + ') меньше одного кадра ' + w + '×' + h + ': уменьшите размер в «Настройках»');
+    n = Math.min(cols * rows, cap);
+    var out = new Uint8Array(nb), cell = new Uint8ClampedArray(w * h * 4);
+    for (k = 0; k < n; k++) {
+      var cx = (k % cols) * w, cy = Math.floor(k / cols) * h;
+      for (y = 0; y < h; y++) { var s = ((cy + y) * iw + cx) * 4; cell.set(d.subarray(s, s + w * 4), y * w * 4); }
+      packRGBA(cell, ns, out);
+      lines.push(enc(out));
+    }
+  } else {
+    var cnt = iw * ih, st = new Uint8Array(cnt * 3), i, o;
+    for (i = 0, o = 0; i < cnt; i++, o += 3) { st[o] = d[i * 4]; st[o + 1] = d[i * 4 + 1]; st[o + 2] = d[i * 4 + 2]; }
+    n = Math.min(Math.floor(st.length / nb), cap);
+    if (!n) throw new Error('в картинке меньше данных (' + st.length + ' байт), чем в одном кадре (' + nb + ' байт): уменьшите размер или число цветов');
+    for (k = 0; k < n; k++) { var b = st.slice(k * nb, (k + 1) * nb); maskPad(b, ns); lines.push(enc(b)); }
+  }
+  if (!n) throw new Error('не получилось ни одного кадра');
+  return '#babel1 w=' + w + ' h=' + h + ' b=' + ns.bpp + ' fps=8.000 every=1\n' + lines.join('\n') + '\n';
+}
 function saveBlob(blob, name) {
   var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
@@ -788,6 +866,16 @@ $('vPng').addEventListener('click', function () {
       var p = parseFilm(filmText);
       saveBlob(blob, 'babel-film-' + (p.meta.w || S.w) + 'x' + (p.meta.h || S.h) + '-' + p.ids.length + 'f.png');
       toast('PNG: ' + (blob.size / 1e6).toFixed(1) + ' МБ');
+    });
+  } catch (e) { toast(e.message); }
+});
+$('vRaw').addEventListener('click', function () {
+  if (!filmText) return;
+  try {
+    filmToRaw(filmText, function (blob) {
+      var p = parseFilm(filmText);
+      saveBlob(blob, 'babel-raw-' + (p.meta.w || S.w) + 'x' + (p.meta.h || S.h) + '-' + p.ids.length + 'f.png');
+      toast('PNG-каша: ' + (blob.size / 1e6).toFixed(1) + ' МБ');
     });
   } catch (e) { toast(e.message); }
 });
